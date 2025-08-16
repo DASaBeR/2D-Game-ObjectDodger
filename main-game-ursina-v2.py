@@ -10,8 +10,8 @@ class ObjectDodgerGame(Entity):
         super().__init__()
         
         # Game settings
-        self.player_speed = 0.05
-        self.object_speed = 0.5
+        self.player_speed = 0.1
+        self.object_speed = 0.2
         self.max_speed = 3.0
         self.speed_increment = 0.005
         self.spawn_rate = 1.0  # seconds
@@ -23,6 +23,8 @@ class ObjectDodgerGame(Entity):
         self.cap = None  # OpenCV video capture
         self.previous_frame = None
         self.face_cascade = None
+        #self.face_smoothing_factor = 0.2  # New smoothing factor for webcam movement
+
         
         # Create game environment
         self.create_scene()
@@ -256,8 +258,8 @@ class ObjectDodgerGame(Entity):
                     self.player.z = -((face_center_y / frame.shape[0]) * 4)
                     
                     # Constrain player movement
-                    self.player.x = max(-2, min(2, self.player.x))
-                    self.player.z = max(-4, min(0, self.player.z))
+                    self.player.x = max(-2, min(2, self.player.x * 4))
+                    self.player.z = max(-4, min(0, self.player.z * 4))
                     
         except Exception as e:
             print(f"Webcam processing error: {e}")
@@ -300,7 +302,6 @@ class ObjectDodgerGame(Entity):
         
         # Schedule next spawn
         invoke(self.spawn_object, delay=self.spawn_rate)
-    
     def update(self):
         if self.game_over:
             return
@@ -310,34 +311,37 @@ class ObjectDodgerGame(Entity):
             self.process_webcam_input()
         
         # Move obstacles and check collisions
-        for obstacle in self.obstacles.children.copy():
+        for obstacle in list(self.obstacles.children):
             if not obstacle.enabled:
                 continue
                 
-            obstacle.z -= self.object_speed * time.dt * 60
-            
-            # Check collision
-            if obstacle.z < -5:
-                if obstacle.intersects(self.player).hit:
-                    self.hearts -= 1
-                    self.hearts_text.text = f'Lives: {self.hearts}'
+            try:
+                obstacle.z -= self.object_speed * time.dt * 60
+                
+                # Check if obstacle is in collision range
+                if -5 < obstacle.z < 5:  # Only check collisions when obstacle is near player
+                    if obstacle.intersects(self.player).hit:
+                        self.hearts -= 1
+                        self.hearts_text.text = f'Lives: {self.hearts}'
+                        destroy(obstacle)
+                        
+                        if self.hearts <= 0:
+                            self.game_over = True
+                            self.show_game_over()
+                        continue  # Skip the rest for this obstacle
+                
+                # Remove off-screen obstacles and increase score
+                if obstacle.z < -10:
+                    self.score += 1
+                    self.score_text.text = f'Score: {self.score}'
                     destroy(obstacle)
-                    
-                    if self.hearts <= 0:
-                        self.game_over = True
-                        self.show_game_over()
-                        return
-            
-            # Remove off-screen obstacles and increase score
-            if obstacle.z < -10:
-                self.score += 1
-                self.score_text.text = f'Score: {self.score}'
-                destroy(obstacle)
+            except:
+                continue
         
         # Increase difficulty
         if self.object_speed < self.max_speed:
             self.object_speed += self.speed_increment * time.dt
-    
+
     def show_game_over(self):
         self.game_over_text.text = f"Game Over! Score: {self.score}"
         self.game_over_text.enabled = True
@@ -357,7 +361,7 @@ class ObjectDodgerGame(Entity):
         # Reset game state
         self.hearts = 3
         self.score = 0
-        self.object_speed = 0.5
+        self.object_speed = 0.2
         self.game_over = False
         
         # Reset UI
