@@ -17,6 +17,7 @@ class ObjectDodgerGame(Entity):
 
         # Gameplay params
         self.player_speed = 0.1
+        self.face_player_speed = 4       # New variable to control player speed in face detection mode
         self.object_speed = 0.2
         self.max_speed = 3.0
         self.speed_increment = 0.005
@@ -296,9 +297,19 @@ class ObjectDodgerGame(Entity):
                     self.target_pos.x = max(-2, min(2, self.target_pos.x))
                     self.target_pos.z = max(-4, min(0, self.target_pos.z))
 
-            # Apply to player
-            self.player.x = self.target_pos.x
-            self.player.z = self.target_pos.z
+            # Move player towards the target position at face_player_speed
+            dx = (self.target_pos.x * self.face_player_speed) - self.player.x
+            dz = (self.target_pos.z * self.face_player_speed) - self.player.z
+            dist = ((dx ** 2) + (dz ** 2)) ** 0.5
+
+            if dist > 0:
+                move_amount = min(self.face_player_speed, dist)
+                self.player.x += (dx / dist) * move_amount
+                self.player.z += (dz / dist) * move_amount
+
+            # Clamp player position
+            self.player.x = max(-2, min(2, self.player.x))
+            self.player.z = max(-4, min(0, self.player.z))
 
         except Exception as e:
             print(f"Face processing error: {e}")
