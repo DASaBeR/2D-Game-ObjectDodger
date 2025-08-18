@@ -1,15 +1,21 @@
+# main-game-ursina-mediapipe.py
 from ursina import *
 import cv2
 import numpy as np
 import os
 import random
 import time
+import mediapipe as mp
 
 class ObjectDodgerGame(Entity):
     def __init__(self):
         super().__init__()
-        
-        # Game settings
+
+        # Game state
+        self.game_state = 'await_mode'     # 'await_mode' | 'running' | 'game_over'
+        self.input_mode = None             # 'keyboard' | 'face'
+
+        # Gameplay params
         self.player_speed = 0.1
         self.object_speed = 0.2
         self.max_speed = 3.0
@@ -17,63 +23,53 @@ class ObjectDodgerGame(Entity):
         self.spawn_rate = 1.0  # seconds
         self.hearts = 3
         self.score = 0
-        self.game_over = False
-        self.input_mode = None  # 'webcam' or 'keyboard' or 'face'
-        self.webcam_available = False
-        self.cap = None  # OpenCV video capture
-        self.previous_frame = None
-        self.face_cascade = None
-        #self.face_smoothing_factor = 0.2  # New smoothing factor for webcam movement
 
-        
-        # Create game environment
+        # Vision (created only if Face mode is chosen)
+        self.cap = None
+        self.mp_face = mp.solutions.face_detection
+        self.face_detector = None
+        self.face_confidence = 0.5
+        self.face_model_selection = 1  # 0: short range (~2m), 1: full (~5m)
+
+        # Smoothed target for face-driven motion
+        self.smooth_alpha = 0.25
+        self.target_pos = Vec3(0, 0.5, -5)
+
+        # Scene/UI
         self.create_scene()
-        
-        # Setup webcam if available
-        self.init_webcam()
-        
-        # Start game loop
-        invoke(self.spawn_object, delay=self.spawn_rate)
-        
-        # Bind keys
+
+        # Bind keyboard update (only acts if mode == keyboard & running)
         self.key_handler = Entity()
         self.key_handler.update = self.keyboard_input
-        
+
+    # ---------- Scene / UI ----------
     def create_scene(self):
-        # Create sky
         Sky(texture='sky_sunset')
-        
-        # Create ground
+
         Entity(
-            model='plane', 
-            texture='grass', 
-            scale=100, 
+            model='plane',
+            texture='grass',
+            scale=100,
             collider='mesh',
             position=(0, -1, 0),
             double_sided=True
         )
-        
-        # Create player
+
         self.player = Entity(
-            model='sphere', 
-            color=color.green, 
+            model='sphere',
+            color=color.green,
             scale=0.5,
             position=(0, 0.5, -5),
             collider='sphere'
         )
-        
-        # Create obstacles container
+
         self.obstacles = Entity()
-        
-        # Create UI elements
         self.create_ui()
-        
-        # Create lighting
+
         DirectionalLight(parent=camera, position=(0, 10, -10), shadows=True)
         AmbientLight(color=color.rgba(100, 100, 100, 0.1))
-    
+
     def create_ui(self):
-        # Score display
         self.score_text = Text(
             text=f'Score: {self.score}',
             position=(-0.8, 0.45),
@@ -81,8 +77,7 @@ class ObjectDodgerGame(Entity):
             color=color.white,
             font='unifont-14.0.02.ttf'
         )
-        
-        # Hearts display
+
         self.hearts_text = Text(
             text=f'Lives: {self.hearts}',
             position=(-0.8, 0.4),
@@ -90,44 +85,35 @@ class ObjectDodgerGame(Entity):
             color=color.red,
             font='unifont-14.0.02.ttf'
         )
-        
-        # Input choice UI
+
         self.input_choice_text = Text(
-            text="Choose Input Method:",
+            text="Choose Control Mode",
             position=(0, 0.2),
             scale=2,
             color=color.white,
             background=True,
             font='unifont-14.0.02.ttf'
         )
-        
-        self.webcam_button = Button(
-            text="Webcam Motion (W)",
-            color=color.blue,
-            position=(-0.3, 0),
-            scale=(0.3, 0.1),
-            on_click=self.choose_webcam
-        )
-        
+
+        # Only two buttons now: Keyboard & Face
         self.keyboard_button = Button(
             text="Keyboard (K)",
             color=color.orange,
-            position=(0, 0),
-            scale=(0.3, 0.1),
+            position=(-0.18, 0),
+            scale=(0.35, 0.1),
             on_click=self.choose_keyboard
         )
-        
+
         self.face_button = Button(
-            text="Face Tracking (F)",
+            text="Face Detection (F)",
             color=color.pink,
-            position=(0.3, 0),
-            scale=(0.3, 0.1),
-            on_click=self.choose_face_tracking
+            position=(0.18, 0),
+            scale=(0.35, 0.1),
+            on_click=self.choose_face_detection
         )
-        
-        # Webcam connection message
-        self.webcam_message = Text(
-            text="Please connect your webcam...",
+
+        self.camera_message = Text(
+            text="Initializing camera…",
             position=(0, -0.2),
             scale=1.5,
             color=color.yellow,
@@ -135,8 +121,17 @@ class ObjectDodgerGame(Entity):
             enabled=False,
             font='unifont-14.0.02.ttf'
         )
-        
-        # Game over screen
+
+        self.camera_error = Text(
+            text="Camera/Face detection unavailable. Please check your webcam.",
+            position=(0, -0.28),
+            scale=1.3,
+            color=color.red,
+            background=True,
+            enabled=False,
+            font='unifont-14.0.02.ttf'
+        )
+
         self.game_over_text = Text(
             text="",
             position=(0, 0.1),
@@ -146,7 +141,7 @@ class ObjectDodgerGame(Entity):
             enabled=False,
             font='unifont-14.0.02.ttf'
         )
-        
+
         self.restart_button = Button(
             text="Play Again",
             color=color.green,
@@ -155,122 +150,94 @@ class ObjectDodgerGame(Entity):
             on_click=self.restart_game,
             enabled=False
         )
-    
-    def init_webcam(self):
-        try:
-            self.cap = cv2.VideoCapture(0)
-            if self.cap.isOpened():
-                self.webcam_available = True
-                # Load the face detection cascade
-                self.face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-                return True
-            return False
-        except Exception as e:
-            print(f"Webcam initialization error: {e}")
-            return False
-    
-    def choose_webcam(self):
-        self.input_mode = 'webcam'
-        self.hide_input_choice()
-        
-        if not self.webcam_available:
-            self.webcam_message.enabled = True
-            if not self.init_webcam():
-                self.choose_keyboard()  # Fallback to keyboard if webcam fails
-    
-    def choose_keyboard(self):
-        self.input_mode = 'keyboard'
-        self.hide_input_choice()
-    
-    def choose_face_tracking(self):
-        self.input_mode = 'face'
-        self.hide_input_choice()
-        
-        if not self.webcam_available:
-            self.webcam_message.enabled = True
-            if not self.init_webcam():
-                self.choose_keyboard()  # Fallback to keyboard if webcam fails
-    
+
+    # ---------- Mode selection ----------
     def hide_input_choice(self):
         self.input_choice_text.enabled = False
-        self.webcam_button.enabled = False
         self.keyboard_button.enabled = False
         self.face_button.enabled = False
-    
-    def process_webcam_input(self):
-        if not self.webcam_available or self.cap is None:
+
+    def choose_keyboard(self):
+        if self.game_state != 'await_mode':
             return
-            
+        self.input_mode = 'keyboard'
+        self.hide_input_choice()
+        # Start game immediately for keyboard
+        self.start_game()
+
+    def choose_face_detection(self):
+        if self.game_state != 'await_mode':
+            return
+        self.input_mode = 'face'
+        self.hide_input_choice()
+
+        # Lazy init camera + MediaPipe, and only start game if fully OK
+        self.camera_message.text = "Initializing camera…"
+        self.camera_message.enabled = True
+        success = self.init_face_pipeline()
+
+        if success:
+            self.camera_message.enabled = False
+            self.camera_error.enabled = False
+            self.start_game()
+        else:
+            # Stay in await_mode so nothing spawns; allow user to pick keyboard
+            self.camera_message.enabled = False
+            self.camera_error.enabled = True
+            self.input_choice_text.text = "Choose Control Mode (camera failed)"
+            self.input_choice_text.enabled = True
+            self.keyboard_button.enabled = True
+            self.face_button.enabled = True
+            self.input_mode = None  # back to no mode
+
+    # ---------- Face pipeline ----------
+    def init_face_pipeline(self):
         try:
-            # Get webcam frame
-            ret, frame = self.cap.read()
-            if not ret:
-                return
-                
-            if self.input_mode == 'webcam':
-                # Original motion detection logic
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                gray = cv2.GaussianBlur(gray, (21, 21), 0)
-                
-                if self.previous_frame is None:
-                    self.previous_frame = gray
-                    return
-                    
-                frame_delta = cv2.absdiff(self.previous_frame, gray)
-                thresh = cv2.threshold(frame_delta, 25, 255, cv2.THRESH_BINARY)[1]
-                thresh = cv2.dilate(thresh, None, iterations=2)
-                
-                contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                
-                for contour in contours:
-                    if cv2.contourArea(contour) < 500:
-                        continue
-                    
-                    (x, y, w, h) = cv2.boundingRect(contour)
-                    center_x = x + w / 2
-                    center_y = y + h / 2
-                    
-                    self.player.x = (center_x / frame.shape[1]) * 4 - 2
-                    self.player.z = (center_y / frame.shape[0]) * 2 - 3
-                    
-                    self.player.x = max(-2, min(2, self.player.x))
-                    self.player.z = max(-4, min(0, self.player.z))
-                
-                self.previous_frame = gray
-            
-            elif self.input_mode == 'face':
-                # Face detection logic
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                faces = self.face_cascade.detectMultiScale(gray, 1.1, 4)
-                
-                if len(faces) > 0:
-                    # Get the largest face (assuming it's the player)
-                    (x, y, w, h) = max(faces, key=lambda f: f[2] * f[3])
-                    
-                    # Calculate center of face
-                    face_center_x = x + w / 2
-                    face_center_y = y + h / 2
-                    
-                    # Map face position to game coordinates
-                    # X position: map from 0-frame width to -2 to 2
-                    self.player.x = (face_center_x / frame.shape[1]) * 4 - 2
-                    # Z position: map from 0-frame height to -4 to 0 (reverse Y axis)
-                    self.player.z = -((face_center_y / frame.shape[0]) * 4)
-                    
-                    # Constrain player movement
-                    self.player.x = max(-2, min(2, self.player.x * 4))
-                    self.player.z = max(-4, min(0, self.player.z * 4))
-                    
+            self.cap = cv2.VideoCapture(0)
+            if not self.cap or not self.cap.isOpened():
+                return False
+
+            # Warm-up read to ensure frames are available
+            ok, frame = self.cap.read()
+            if not ok or frame is None:
+                return False
+
+            # Create MediaPipe detector
+            self.face_detector = self.mp_face.FaceDetection(
+                model_selection=self.face_model_selection,
+                min_detection_confidence=self.face_confidence
+            )
+            return True
         except Exception as e:
-            print(f"Webcam processing error: {e}")
-            self.webcam_available = False
-            self.cap = None
-    
+            print(f"Face pipeline init error: {e}")
+            return False
+
+    # ---------- Game lifecycle ----------
+    def start_game(self):
+        # Called only after mode chosen & (for face) camera initialized successfully
+        self.game_state = 'running'
+        # Kick off spawns only now
+        invoke(self.spawn_object, delay=self.spawn_rate)
+
+    def spawn_object(self):
+        if self.game_state != 'running':
+            return  # Never spawn before running or after game over
+
+        obstacle = Entity(
+            model='cube',
+            color=color.red,
+            scale=(0.5, 0.5, 0.5),
+            position=(random.uniform(-2, 2), 0.25, 20),
+            collider='box'
+        )
+        obstacle.parent = self.obstacles
+        invoke(self.spawn_object, delay=self.spawn_rate)
+
+    # ---------- Input handling ----------
     def keyboard_input(self):
-        if self.input_mode != 'keyboard' or self.game_over:
+        if self.input_mode != 'keyboard' or self.game_state != 'running':
             return
-            
-        # Arrow key movement
+
         if held_keys['left arrow'] or held_keys['a']:
             self.player.x -= self.player_speed
         if held_keys['right arrow'] or held_keys['d']:
@@ -279,114 +246,148 @@ class ObjectDodgerGame(Entity):
             self.player.z += self.player_speed
         if held_keys['down arrow'] or held_keys['s']:
             self.player.z -= self.player_speed
-        
-        # Constrain player movement
+
         self.player.x = max(-2, min(2, self.player.x))
         self.player.z = max(-4, min(0, self.player.z))
-    
-    def spawn_object(self):
-        if self.game_over:
+
+    def process_face_input(self):
+        # Only runs after face mode selected & camera initialized & game running
+        if self.input_mode != 'face' or self.game_state != 'running':
             return
-            
-        # Create new obstacle
-        obstacle = Entity(
-            model='cube',
-            color=color.red,
-            scale=(0.5, 0.5, 0.5),
-            position=(random.uniform(-2, 2), 0.25, 20),
-            collider='box'
-        )
-        
-        # Add to obstacles container
-        obstacle.parent = self.obstacles
-        
-        # Schedule next spawn
-        invoke(self.spawn_object, delay=self.spawn_rate)
+        if self.cap is None or self.face_detector is None:
+            return
+
+        try:
+            ok, frame = self.cap.read()
+            if not ok or frame is None:
+                return
+
+            h, w = frame.shape[:2]
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res = self.face_detector.process(rgb)
+
+            if res.detections:
+                # Pick largest face
+                boxes = []
+                for det in res.detections:
+                    bb = det.location_data.relative_bounding_box
+                    x = max(0, int(bb.xmin * w))
+                    y = max(0, int(bb.ymin * h))
+                    bw = max(1, int(bb.width * w))
+                    bh = max(1, int(bb.height * h))
+                    x = min(x, w - 1)
+                    y = min(y, h - 1)
+                    bw = min(bw, w - x)
+                    bh = min(bh, h - y)
+                    boxes.append((x, y, bw, bh))
+
+                if boxes:
+                    x, y, bw, bh = max(boxes, key=lambda b: b[2] * b[3])
+                    cx = x + bw / 2
+                    cy = y + bh / 2
+
+                    mapped_x = (cx / w) * 4 - 2          # [-2, 2]
+                    mapped_z = -((cy / h) * 4)           # [0..-4]
+
+                    # Smooth
+                    self.target_pos.x = (1 - self.smooth_alpha) * self.target_pos.x + self.smooth_alpha * mapped_x
+                    self.target_pos.z = (1 - self.smooth_alpha) * self.target_pos.z + self.smooth_alpha * mapped_z
+
+                    self.target_pos.x = max(-2, min(2, self.target_pos.x))
+                    self.target_pos.z = max(-4, min(0, self.target_pos.z))
+
+            # Apply to player
+            self.player.x = self.target_pos.x
+            self.player.z = self.target_pos.z
+
+        except Exception as e:
+            print(f"Face processing error: {e}")
+
+    # ---------- Per-frame update ----------
     def update(self):
-        if self.game_over:
+        if self.game_state != 'running':
             return
-            
-        # Process input
-        if self.input_mode in ['webcam', 'face']:
-            self.process_webcam_input()
-        
-        # Move obstacles and check collisions
+
+        if self.input_mode == 'face':
+            self.process_face_input()
+
+        # Move obstacles and detect collisions
         for obstacle in list(self.obstacles.children):
             if not obstacle.enabled:
                 continue
-                
             try:
                 obstacle.z -= self.object_speed * time.dt * 60
-                
-                # Check if obstacle is in collision range
-                if -5 < obstacle.z < 5:  # Only check collisions when obstacle is near player
+                if -5 < obstacle.z < 5:
                     if obstacle.intersects(self.player).hit:
                         self.hearts -= 1
                         self.hearts_text.text = f'Lives: {self.hearts}'
                         destroy(obstacle)
-                        
                         if self.hearts <= 0:
                             self.game_over = True
                             self.show_game_over()
-                        continue  # Skip the rest for this obstacle
-                
-                # Remove off-screen obstacles and increase score
+                        continue
                 if obstacle.z < -10:
                     self.score += 1
                     self.score_text.text = f'Score: {self.score}'
                     destroy(obstacle)
             except:
                 continue
-        
-        # Increase difficulty
+
         if self.object_speed < self.max_speed:
             self.object_speed += self.speed_increment * time.dt
 
+    # ---------- Game over / restart ----------
     def show_game_over(self):
+        self.game_state = 'game_over'
         self.game_over_text.text = f"Game Over! Score: {self.score}"
         self.game_over_text.enabled = True
         self.restart_button.enabled = True
-        
-        # Save high score
         self.save_high_score()
-    
+
     def save_high_score(self):
         try:
             with open('highscores.txt', 'a') as f:
-                f.write(f'{time.time()},{self.score}\n')
+                f.write(f'{int(time.time())},{self.score}\n')
         except Exception as e:
             print(f"Error saving score: {e}")
-    
+
     def restart_game(self):
-        # Reset game state
+        # Reset everything but stay in running with the same mode
         self.hearts = 3
         self.score = 0
         self.object_speed = 0.2
-        self.game_over = False
-        
-        # Reset UI
         self.score_text.text = f'Score: {self.score}'
         self.hearts_text.text = f'Lives: {self.hearts}'
         self.game_over_text.enabled = False
         self.restart_button.enabled = False
-        
-        # Clear obstacles
+
         for obstacle in self.obstacles.children:
             destroy(obstacle)
-        
-        # Reset player position
+
         self.player.position = (0, 0.5, -5)
-        
-        # Restart spawning
+        self.target_pos = Vec3(0, 0.5, -5)
+        self.game_state = 'running'
         invoke(self.spawn_object, delay=self.spawn_rate)
 
-# Setup and run the game
+    # ---------- Cleanup ----------
+    def cleanup(self):
+        try:
+            if self.face_detector is not None:
+                self.face_detector.close()
+        except:
+            pass
+        try:
+            if self.cap is not None:
+                self.cap.release()
+        except:
+            pass
+
+
+# ---------- App setup ----------
 app = Ursina(borderless=False)
+window.title = "3D Object Dodger - Keyboard / MediaPipe Face Detection"
 
-# Set window title
-window.title = "3D Object Dodger - Face Tracking"
-
-# Download font that supports special characters if needed
+# Ensure font exists (safe to keep)
 if not os.path.exists('unifont-14.0.02.ttf'):
     import urllib.request
     urllib.request.urlretrieve(
@@ -394,15 +395,26 @@ if not os.path.exists('unifont-14.0.02.ttf'):
         'unifont-14.0.02.ttf'
     )
 
-# Start the game
 game = ObjectDodgerGame()
-
-# Camera setup
 camera.position = (0, 10, -20)
 camera.rotation_x = 30
 
+# Quick key shortcuts for mode selection while on the menu
+def input(key):
+    if game.game_state == 'await_mode':
+        if key.lower() == 'k':
+            game.choose_keyboard()
+        elif key.lower() == 'f':
+            game.choose_face_detection()
+
+def on_exit():
+    game.cleanup()
+
+app.exit_func = on_exit
 app.run()
 
-# Release webcam when done
-if game.cap is not None:
-    game.cap.release()
+# Safety fallback
+try:
+    game.cleanup()
+except:
+    pass
