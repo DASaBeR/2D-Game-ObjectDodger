@@ -8,3 +8,6 @@
 /main-deepseek.py
 /main.py
 /main-game-ursina.py
+_opencv_camera_test.py
+_ursina_render_sanity.py
+highscores.txt
